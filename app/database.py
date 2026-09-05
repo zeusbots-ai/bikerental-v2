@@ -45,7 +45,22 @@ async def init_db():
     await db_manager.db.orders.create_index("hold_expires_at")
     await db_manager.db.payments.create_index("payment_id", unique=True)
     await db_manager.db.payments.create_index("order_id")
-    await db_manager.db.payments.create_index("idempotency_key", unique=True, sparse=True)
+    # Safely recreate idempotency_key index with partialFilterExpression to avoid duplicate null errors
+    try:
+        existing_indexes = await db_manager.db.payments.index_information()
+        if "idempotency_key_1" in existing_indexes:
+            idx_info = existing_indexes["idempotency_key_1"]
+            if not idx_info.get("sparse") or not idx_info.get("partialFilterExpression"):
+                await db_manager.db.payments.drop_index("idempotency_key_1")
+    except Exception as e:
+        logger.debug(f"[DB] Index inspection note: {e}")
+
+    await db_manager.db.payments.create_index(
+        "idempotency_key",
+        unique=True,
+        sparse=True,
+        partialFilterExpression={"idempotency_key": {"$type": "string"}}
+    )
     await db_manager.db.admins.create_index("phone_number", unique=True)
     await db_manager.db.audit_logs.create_index("timestamp")
 

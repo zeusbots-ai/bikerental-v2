@@ -119,7 +119,6 @@ async def hold_vehicle_and_create_order(
         "status": PaymentStatus.PENDING.value,
         "provider": settings.PAYMENT_PROVIDER,
         "provider_payment_id": None,
-        "idempotency_key": None,
         "created_at": now,
         "expires_at": hold_expires_at,
         "verified_at": None
