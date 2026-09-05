@@ -36,7 +36,7 @@ try:
         FASTAPI_WEBHOOK_URL: str = "http://localhost:8000/api/v1/whatsapp/webhook"
         MONGODB_URI: str = "mongodb+srv://rishu:Khushi@cluster0.3o5g1pe.mongodb.net/?appName=Cluster0"
         MONGODB_DB_NAME: str = "hostel_rental_db"
-        ADMIN_PHONE_NUMBERS: str = "916371737949,919876543210"
+        ADMIN_PHONE_NUMBERS: str = "916371737949"
         WHATSAPP_PROVIDER: str = "web"
         PAYMENT_PROVIDER: str = "mock"
         RAZORPAY_KEY_ID: str = ""
@@ -67,7 +67,7 @@ except ImportError:
         FASTAPI_WEBHOOK_URL: str = os.getenv("FASTAPI_WEBHOOK_URL", "http://localhost:8000/api/v1/whatsapp/webhook")
         MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
         MONGODB_DB_NAME: str = os.getenv("MONGODB_DB_NAME", "hostel_rental_db")
-        ADMIN_PHONE_NUMBERS: str = os.getenv("ADMIN_PHONE_NUMBERS", "916371737949,919876543210")
+        ADMIN_PHONE_NUMBERS: str = os.getenv("ADMIN_PHONE_NUMBERS", "916371737949")
         WHATSAPP_PROVIDER: str = os.getenv("WHATSAPP_PROVIDER", "web")
         PAYMENT_PROVIDER: str = os.getenv("PAYMENT_PROVIDER", "mock")
         RAZORPAY_KEY_ID: str = os.getenv("RAZORPAY_KEY_ID", "")

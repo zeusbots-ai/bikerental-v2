@@ -72,6 +72,19 @@ async def init_db():
                 "created_at": datetime.now(timezone.utc)
             })
             logger.info(f"Bootstrapped superadmin: {phone}")
+        else:
+            await db_manager.db.admins.update_one(
+                {"phone_number": phone},
+                {"$set": {"is_active": True}}
+            )
+
+    # Deactivate any admins not present in settings.admin_phone_list
+    deactivated = await db_manager.db.admins.update_many(
+        {"phone_number": {"$nin": settings.admin_phone_list}},
+        {"$set": {"is_active": False}}
+    )
+    if deactivated.modified_count > 0:
+        logger.info(f"Deactivated {deactivated.modified_count} stale admin(s) not in settings.admin_phone_list.")
 
     logger.info("MongoDB indexes and initialization completed successfully.")
 

@@ -15,7 +15,10 @@ def format_cuap_id_request() -> str:
     return (
         "📸 *CUAP Student Verification*\n\n"
         "Please send a clear photo of your *CUAP Student ID Card*.\n\n"
-        "⚠️ _Make sure your Name, Roll Number, and Photo are clearly legible._"
+        "💡 *Tips for instant approval:*\n"
+        "• Ensure your Name, Roll Number, and Photo are sharp and clearly legible.\n"
+        "• Send as *HD photo* or as a *Document* (📎 -> Document) for maximum clarity.\n"
+        "• Make sure 'View Once' is *turned off*."
     )
 
 def format_non_student_message() -> str:

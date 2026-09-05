@@ -10,26 +10,13 @@ logger = logging.getLogger(__name__)
 
 async def _get_admin_targets() -> List[str]:
     """
-    Resolves the list of admin destinations, prioritizing stored WhatsApp JIDs
-    (such as privacy @lid addresses) over plain phone numbers to avoid delivery failures.
+    Resolves the list of admin destinations strictly based on settings.admin_phone_list.
+    Only configured admin phones (e.g. 916371737949) are targeted.
+    Prioritizes stored WhatsApp JIDs (such as privacy @lid addresses) over plain phone numbers
+    to avoid delivery failures.
     """
     db = get_database()
-    raw_targets = set()
-    for p in settings.admin_phone_list:
-        raw_targets.add(normalize_phone(p))
-
-    if db is not None:
-        try:
-            cursor = db.admins.find({"is_active": True})
-            async for admin in cursor:
-                wa_jid = admin.get("wa_jid")
-                phone = admin.get("phone_number")
-                if wa_jid and "@" in wa_jid:
-                    raw_targets.add(wa_jid)
-                elif phone:
-                    raw_targets.add(normalize_phone(phone))
-        except Exception as e:
-            logger.error(f"[WhatsAppService] Error fetching admins from DB: {e}")
+    raw_targets = [normalize_phone(p) for p in settings.admin_phone_list if p.strip()]
 
     resolved = []
     if db is not None:
@@ -40,7 +27,7 @@ async def _get_admin_targets() -> List[str]:
                 try:
                     norm = normalize_phone(t)
                     candidates = list({c for c in [norm, t, norm[2:] if norm.startswith("91") else None] if c})
-                    admin_doc = await db.admins.find_one({"phone_number": {"$in": candidates}})
+                    admin_doc = await db.admins.find_one({"phone_number": {"$in": candidates}, "is_active": True})
                     if admin_doc and admin_doc.get("wa_jid"):
                         resolved.append(admin_doc["wa_jid"])
                         continue
@@ -61,6 +48,7 @@ async def _get_admin_targets() -> List[str]:
             seen.add(r)
             deduped.append(r)
     return deduped
+
 
 class WhatsAppService:
     def __init__(self):

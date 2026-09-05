@@ -5,13 +5,17 @@ from app.admin.commands import is_admin_authorized, AdminCommandHandler
 class TestAdminCommands(unittest.IsolatedAsyncioTestCase):
 
     async def test_admin_authorization(self):
-        # 919876543210 is in settings.admin_phone_list
-        authorized = await is_admin_authorized("919876543210")
+        # 916371737949 is in settings.admin_phone_list
+        authorized = await is_admin_authorized("916371737949")
         self.assertTrue(authorized)
 
         # Formats with + or spaces should also be handled cleanly
-        authorized_with_plus = await is_admin_authorized("+91 9876543210")
+        authorized_with_plus = await is_admin_authorized("+91 6371737949")
         self.assertTrue(authorized_with_plus)
+
+        # 10-digit format without 91 prefix
+        authorized_ten_digit = await is_admin_authorized("6371737949")
+        self.assertTrue(authorized_ten_digit)
 
         # Random user phone should not be authorized
         unauthorized = await is_admin_authorized("919999999999")
@@ -42,7 +46,7 @@ class TestAdminCommands(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Admin Command Center", resp)
 
     async def test_help_command(self):
-        response = await AdminCommandHandler.handle_command("919876543210", "/help")
+        response = await AdminCommandHandler.handle_command("916371737949", "/help")
         self.assertIn("Admin Command Center", response)
         self.assertIn("/start", response)
         self.assertIn("/end", response)

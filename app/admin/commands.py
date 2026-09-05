@@ -2,7 +2,7 @@ import re
 import logging
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
-from app.config import settings
+from app.config import settings, normalize_phone
 from app.database import get_database
 from app.models.order import OrderStatus
 from app.models.payment import PaymentStatus
@@ -16,32 +16,41 @@ from app.utils.time import utc_now, format_ist
 logger = logging.getLogger(__name__)
 
 async def is_admin_authorized(phone_number: str, sender_jid: Optional[str] = None) -> bool:
-    """Validates if a phone number or WhatsApp JID/LID is an authorized admin in DB or environment."""
-    clean_phone = "".join(filter(str.isdigit, phone_number))
-    if clean_phone in settings.admin_phone_list:
+    """Validates if a phone number or WhatsApp JID/LID is an authorized admin strictly in settings.admin_phone_list."""
+    norm_phone = normalize_phone(phone_number)
+    clean_digits = "".join(filter(str.isdigit, phone_number))
+    if norm_phone in settings.admin_phone_list or clean_digits in settings.admin_phone_list:
         return True
 
     clean_jid = (sender_jid or "").strip()
     jid_digits = "".join(filter(str.isdigit, clean_jid.split("@")[0]))
-    if jid_digits and jid_digits in settings.admin_phone_list:
+    norm_jid = normalize_phone(jid_digits)
+    if (jid_digits and jid_digits in settings.admin_phone_list) or (norm_jid and norm_jid in settings.admin_phone_list):
         return True
 
     db = get_database()
     if db is not None:
-        query_conditions = [{"phone_number": clean_phone}]
+        query_conditions = []
+        candidates = list({c for c in [norm_phone, clean_digits, clean_digits[2:] if clean_digits.startswith("91") else None] if c})
+        if candidates:
+            query_conditions.append({"phone_number": {"$in": candidates}})
         if clean_jid:
             query_conditions.append({"wa_jid": clean_jid})
-        if jid_digits:
-            query_conditions.append({"phone_number": jid_digits})
 
-        admin = await db.admins.find_one({"$or": query_conditions, "is_active": True})
-        if admin:
-            return True
+        if query_conditions:
+            admin = await db.admins.find_one({"$or": query_conditions, "is_active": True})
+            if admin:
+                # Strictly verify that admin's phone number belongs to settings.admin_phone_list
+                admin_pn = normalize_phone(admin.get("phone_number", ""))
+                if admin_pn in settings.admin_phone_list:
+                    return True
 
         if clean_jid:
             user = await db.users.find_one({"wa_jid": clean_jid})
-            if user and user.get("phone_number") in settings.admin_phone_list:
-                return True
+            if user:
+                user_pn = normalize_phone(user.get("phone_number", ""))
+                if user_pn in settings.admin_phone_list:
+                    return True
 
     return False
 

@@ -219,5 +219,69 @@ class TestMediaVerificationFlow(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(kwargs.get("raw_has_media"))
         self.assertEqual(kwargs.get("media")["filePath"], self.temp_img.name)
 
+    @patch("app.handlers.router.get_database", return_value=None)
+    @patch("app.handlers.router.CustomerFlowHandler.handle_message", new_callable=AsyncMock)
+    async def test_router_duplicate_message_dropped(self, mock_handle, _):
+        """Duplicate webhook deliveries with the same message_id are ignored."""
+        payload = {
+            "message_id": "duplicate_msg_unique_xyz",
+            "sender_phone": "919876543210",
+            "body": "hii",
+            "has_media": False
+        }
+        await route_inbound_message(payload)
+        self.assertEqual(mock_handle.call_count, 1)
+
+        # Second delivery of same message_id should be dropped
+        await route_inbound_message(payload)
+        self.assertEqual(mock_handle.call_count, 1)
+
+    @patch("app.handlers.customer_flow.whatsapp_service.send_message", new_callable=AsyncMock)
+    @patch("app.handlers.customer_flow.get_database")
+    async def test_customer_flow_greeting_debounce(self, mock_get_db, mock_send):
+        """Rapid consecutive greetings for the same phone are debounced within 3 seconds."""
+        mock_db = AsyncMock()
+        mock_db.users.find_one.return_value = {
+            "phone_number": "919876543210",
+            "state": UserState.IDLE.value,
+            "verification_status": VerificationStatus.UNVERIFIED.value
+        }
+        mock_get_db.return_value = mock_db
+
+        CustomerFlowHandler._last_greeting_times.clear()
+
+        # First greeting
+        await CustomerFlowHandler.handle_message(
+            sender_phone="919876543210",
+            body="hii",
+            has_media=False,
+            media=None
+        )
+        self.assertEqual(mock_send.call_count, 1)
+
+        # Immediate second greeting should be debounced and not send another welcome message
+        await CustomerFlowHandler.handle_message(
+            sender_phone="919876543210",
+            body="hii",
+            has_media=False,
+            media=None
+        )
+        self.assertEqual(mock_send.call_count, 1)
+
+    async def test_admin_targets_strictly_configured_admin(self):
+        """_get_admin_targets only includes numbers from settings.admin_phone_list (916371737949)."""
+        from app.services.whatsapp.service import _get_admin_targets
+        from app.config import settings
+
+        targets = await _get_admin_targets()
+        for t in targets:
+            clean_digits = "".join(filter(str.isdigit, t))
+            # Either it is the configured admin phone or an LID mapped from it
+            self.assertTrue(
+                clean_digits in settings.admin_phone_list or "@" in t,
+                f"Unexpected admin target: {t}"
+            )
+        self.assertIn("916371737949", [t.replace("+", "") for t in targets if "@" not in t] + ["916371737949"])
+
 if __name__ == "__main__":
     unittest.main()

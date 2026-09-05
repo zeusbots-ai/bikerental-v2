@@ -1,5 +1,7 @@
 import json
 import logging
+import time
+from collections import OrderedDict
 from typing import Dict, Any, Optional
 from app.admin.commands import AdminCommandHandler, is_admin_authorized
 from app.handlers.customer_flow import CustomerFlowHandler
@@ -7,6 +9,29 @@ from app.services.whatsapp.service import whatsapp_service
 from app.database import get_database
 
 logger = logging.getLogger(__name__)
+
+# In-memory LRU message_id deduplication cache (drops duplicate webhooks)
+_PROCESSED_MESSAGE_IDS: OrderedDict[str, float] = OrderedDict()
+_MAX_PROCESSED_IDS = 1000
+_DEDUP_TTL_SECONDS = 60.0
+
+def _is_duplicate_message(msg_id: Optional[str]) -> bool:
+    if not msg_id:
+        return False
+    now = time.time()
+    # Prune expired entries
+    while _PROCESSED_MESSAGE_IDS:
+        oldest_id, oldest_ts = next(iter(_PROCESSED_MESSAGE_IDS.items()))
+        if now - oldest_ts > _DEDUP_TTL_SECONDS or len(_PROCESSED_MESSAGE_IDS) > _MAX_PROCESSED_IDS:
+            _PROCESSED_MESSAGE_IDS.pop(oldest_id)
+        else:
+            break
+
+    if msg_id in _PROCESSED_MESSAGE_IDS:
+        return True
+
+    _PROCESSED_MESSAGE_IDS[msg_id] = now
+    return False
 
 async def route_inbound_message(payload: Dict[str, Any]) -> None:
     """
@@ -18,6 +43,11 @@ async def route_inbound_message(payload: Dict[str, Any]) -> None:
     message_id = payload.get("message_id")
     quoted_message = payload.get("quoted_message")
     body = (payload.get("body") or "").strip()
+
+    # Drop duplicate webhook deliveries (prevents duplicate welcome and duplicate handling)
+    if message_id and _is_duplicate_message(message_id):
+        logger.info(f"[Router] Dropping duplicate webhook message delivery: {message_id}")
+        return
 
     # Extract media fields handling snake_case, camelCase, and types
     raw_has_media_val = payload.get("raw_has_media")
@@ -62,7 +92,7 @@ async def route_inbound_message(payload: Dict[str, Any]) -> None:
                 )
                 if admin and admin.get("phone_number"):
                     resolved_admin_phone = "".join(filter(str.isdigit, admin["phone_number"]))
-                    if resolved_admin_phone:
+                    if resolved_admin_phone in settings.admin_phone_list:
                         clean_phone = resolved_admin_phone
                 else:
                     user_doc = await db.users.find_one({"wa_jid": sender_jid})

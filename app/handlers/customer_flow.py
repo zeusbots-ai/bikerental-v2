@@ -24,6 +24,7 @@ from app.utils.time import utc_now
 logger = logging.getLogger(__name__)
 
 class CustomerFlowHandler:
+    _last_greeting_times: Dict[str, float] = {}
 
     @classmethod
     async def handle_message(
@@ -45,12 +46,9 @@ class CustomerFlowHandler:
         if not user:
             user = {
                 "phone_number": clean_phone,
-                "name": None,
-                "is_cuap_student": False,
-                "verification_status": VerificationStatus.UNVERIFIED.value,
-                "current_verification_id": None,
                 "state": UserState.IDLE.value,
-                "temp_booking": {},
+                "verification_status": VerificationStatus.UNVERIFIED.value,
+                "is_cuap_student": False,
                 "created_at": now,
                 "updated_at": now
             }
@@ -60,7 +58,7 @@ class CustomerFlowHandler:
         ver_status = user.get("verification_status", VerificationStatus.UNVERIFIED.value)
 
         # Global restart keywords
-        if text.lower() in ["hi", "hello", "hey", "start", "menu", "restart"]:
+        if text.lower() in ["hi", "hii", "hiii", "hello", "hey", "heyy", "start", "menu", "restart"]:
             await cls._handle_initial_greeting(clean_phone, user)
             return
 
@@ -106,6 +104,14 @@ class CustomerFlowHandler:
 
     @classmethod
     async def _handle_initial_greeting(cls, phone: str, user: Dict[str, Any]):
+        import time
+        now_ts = time.time()
+        last_time = cls._last_greeting_times.get(phone, 0.0)
+        if now_ts - last_time < 3.0:
+            logger.info(f"[CustomerFlow] Suppressing duplicate greeting for {phone} (debounced: {now_ts - last_time:.2f}s since last greeting)")
+            return
+        cls._last_greeting_times[phone] = now_ts
+
         db = get_database()
         ver_status = user.get("verification_status")
 
