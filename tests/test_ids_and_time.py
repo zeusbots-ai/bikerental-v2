@@ -28,5 +28,18 @@ class TestIdsAndTime(unittest.TestCase):
         self.assertIn("02 Sep 2026", ist_str)
         self.assertIn("05:30 PM IST", ist_str)
 
+    def test_normalize_phone(self):
+        from app.config import normalize_phone
+        # 10 digit Indian number
+        self.assertEqual(normalize_phone("8418894051"), "918418894051")
+        self.assertEqual(normalize_phone("6371737949"), "916371737949")
+        # 10 digit with +91 or spaces
+        self.assertEqual(normalize_phone("+91 84188 94051"), "918418894051")
+        # 11 digit with leading zero
+        self.assertEqual(normalize_phone("08418894051"), "918418894051")
+        # JID format preserved
+        self.assertEqual(normalize_phone("162947334668337@lid"), "162947334668337@lid")
+        self.assertEqual(normalize_phone("916371737949@c.us"), "916371737949@c.us")
+
 if __name__ == "__main__":
     unittest.main()

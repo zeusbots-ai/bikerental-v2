@@ -1,7 +1,7 @@
 import logging
 import httpx
 from typing import Dict, Any, Optional
-from app.config import settings
+from app.config import settings, normalize_phone
 from app.database import get_database
 from app.services.whatsapp.base import WhatsAppClientInterface
 
@@ -13,18 +13,29 @@ async def _resolve_target(to: str) -> str:
     real WhatsApp JID for this number (e.g. it's a @lid contact rather than
     @c.us), use that exact JID instead of guessing one from digits.
     """
-    clean_to = "".join(filter(str.isdigit, str(to)))
-    if "@" in str(to):
-        return str(to)  # already a full JID, use as-is
+    to_str = str(to).strip()
+    if "@" in to_str:
+        return to_str  # already a full JID (e.g. @lid or @c.us), use as-is
+
+    clean_to = "".join(filter(str.isdigit, to_str))
+    norm_to = normalize_phone(clean_to)
+    phone_candidates = list({p for p in [clean_to, norm_to] if p})
+
     try:
         db = get_database()
         if db is not None:
-            user = await db.users.find_one({"phone_number": clean_to}, {"wa_jid": 1})
+            # Check db.admins first
+            admin = await db.admins.find_one({"phone_number": {"$in": phone_candidates}}, {"wa_jid": 1})
+            if admin and admin.get("wa_jid"):
+                return admin["wa_jid"]
+
+            # Check db.users
+            user = await db.users.find_one({"phone_number": {"$in": phone_candidates}}, {"wa_jid": 1})
             if user and user.get("wa_jid"):
                 return user["wa_jid"]
     except Exception as e:
         logger.error(f"[BridgeClient] Failed to look up wa_jid for {clean_to}: {e}")
-    return clean_to
+    return norm_to or clean_to
 
 class WhatsAppBridgeClient(WhatsAppClientInterface):
     """

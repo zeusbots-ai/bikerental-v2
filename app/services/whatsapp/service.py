@@ -1,12 +1,66 @@
 import logging
 from typing import List, Optional, Dict, Any
-from app.config import settings
+from app.config import settings, normalize_phone
 from app.database import get_database
 from app.services.whatsapp.base import WhatsAppClientInterface
 from app.services.whatsapp.bridge_client import WhatsAppBridgeClient
 from app.services.whatsapp.cloud_client import MetaWhatsAppCloudClient
 
 logger = logging.getLogger(__name__)
+
+async def _get_admin_targets() -> List[str]:
+    """
+    Resolves the list of admin destinations, prioritizing stored WhatsApp JIDs
+    (such as privacy @lid addresses) over plain phone numbers to avoid delivery failures.
+    """
+    db = get_database()
+    raw_targets = set()
+    for p in settings.admin_phone_list:
+        raw_targets.add(normalize_phone(p))
+
+    if db is not None:
+        try:
+            cursor = db.admins.find({"is_active": True})
+            async for admin in cursor:
+                wa_jid = admin.get("wa_jid")
+                phone = admin.get("phone_number")
+                if wa_jid and "@" in wa_jid:
+                    raw_targets.add(wa_jid)
+                elif phone:
+                    raw_targets.add(normalize_phone(phone))
+        except Exception as e:
+            logger.error(f"[WhatsAppService] Error fetching admins from DB: {e}")
+
+    resolved = []
+    if db is not None:
+        for t in raw_targets:
+            if "@" in t:
+                resolved.append(t)
+            else:
+                try:
+                    norm = normalize_phone(t)
+                    candidates = list({c for c in [norm, t, norm[2:] if norm.startswith("91") else None] if c})
+                    admin_doc = await db.admins.find_one({"phone_number": {"$in": candidates}})
+                    if admin_doc and admin_doc.get("wa_jid"):
+                        resolved.append(admin_doc["wa_jid"])
+                        continue
+                    user_doc = await db.users.find_one({"phone_number": {"$in": candidates}})
+                    if user_doc and user_doc.get("wa_jid"):
+                        resolved.append(user_doc["wa_jid"])
+                        continue
+                except Exception as e:
+                    logger.debug(f"[WhatsAppService] wa_jid lookup error for {t}: {e}")
+                resolved.append(normalize_phone(t))
+    else:
+        resolved = [normalize_phone(t) for t in raw_targets]
+
+    seen = set()
+    deduped = []
+    for r in resolved:
+        if r and r not in seen:
+            seen.add(r)
+            deduped.append(r)
+    return deduped
 
 class WhatsAppService:
     def __init__(self):
@@ -39,42 +93,31 @@ class WhatsAppService:
         Sends notification message (and optional media) to all configured/active admins.
         Returns the count of successfully sent admin notifications.
         """
-        db = get_database()
-        admin_phones = set(settings.admin_phone_list)
-
-        if db is not None:
-            try:
-                cursor = db.admins.find({"is_active": True})
-                async for admin in cursor:
-                    phone = admin.get("phone_number")
-                    if phone:
-                        admin_phones.add(phone.strip().replace("+", ""))
-            except Exception as e:
-                logger.error(f"[WhatsAppService] Error fetching admins from DB: {e}")
+        admin_targets = await _get_admin_targets()
 
         success_count = 0
-        for phone in admin_phones:
+        for target in admin_targets:
             try:
                 sent = False
                 if file_path:
-                    sent = await self.send_media(phone, file_path, caption=message, mime_type=mime_type)
+                    sent = await self.send_media(target, file_path, caption=message, mime_type=mime_type)
                     if not sent:
-                        logger.warning(f"[WhatsAppService] send_media returned False for admin {phone}; falling back to text alert")
-                        sent = await self.send_message(phone, message)
+                        logger.warning(f"[WhatsAppService] send_media returned False for admin {target}; falling back to text alert")
+                        sent = await self.send_message(target, message)
                 else:
-                    sent = await self.send_message(phone, message)
+                    sent = await self.send_message(target, message)
                 if sent:
                     success_count += 1
             except Exception as e:
-                logger.error(f"[WhatsAppService] Failed to notify admin {phone}: {e}")
+                logger.error(f"[WhatsAppService] Failed to notify admin {target}: {e}")
                 # Fallback to text notification if sending media threw an exception
                 if file_path:
                     try:
-                        logger.info(f"[WhatsAppService] Retrying notification for admin {phone} via text alert...")
-                        if await self.send_message(phone, message):
+                        logger.info(f"[WhatsAppService] Retrying notification for admin {target} via text alert...")
+                        if await self.send_message(target, message):
                             success_count += 1
                     except Exception as fallback_e:
-                        logger.error(f"[WhatsAppService] Text fallback also failed for admin {phone}: {fallback_e}")
+                        logger.error(f"[WhatsAppService] Text fallback also failed for admin {target}: {fallback_e}")
 
         return success_count
 
@@ -86,25 +129,15 @@ class WhatsAppService:
         Directly forwards an original WhatsApp message to all admins.
         Preserves 100% original full image resolution without compression.
         """
-        db = get_database()
-        admin_phones = set(settings.admin_phone_list)
-        if db is not None:
-            try:
-                cursor = db.admins.find({"is_active": True})
-                async for admin in cursor:
-                    phone = admin.get("phone_number")
-                    if phone:
-                        admin_phones.add(phone.strip().replace("+", ""))
-            except Exception as e:
-                logger.error(f"[WhatsAppService] Error fetching admins for forward: {e}")
+        admin_targets = await _get_admin_targets()
 
         success_count = 0
-        for phone in admin_phones:
+        for target in admin_targets:
             try:
-                if await self.forward_message(message_id, phone):
+                if await self.forward_message(message_id, target):
                     success_count += 1
             except Exception as e:
-                logger.warning(f"[WhatsAppService] Failed to forward message {message_id} to {phone}: {e}")
+                logger.warning(f"[WhatsAppService] Failed to forward message {message_id} to {target}: {e}")
         return success_count
 
     async def get_status(self) -> Dict[str, Any]:

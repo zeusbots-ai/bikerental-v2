@@ -77,6 +77,21 @@ let latestRawQr = null;
 let latestQrDataUrl = null;
 let botPhoneNumber = null;
 const recentMessages = new Map(); // messageId -> raw message object for forwarding & quotes
+const phoneToJidMap = new Map(); // phone (clean/normalized) -> raw JID (e.g. @lid or @c.us)
+
+function recordPhoneJid(phone, jid) {
+    if (!phone || !jid) return;
+    const jidStr = String(jid).trim();
+    const cleanPhone = String(phone).replace(/[^0-9]/g, '');
+    if (cleanPhone) {
+        phoneToJidMap.set(cleanPhone, jidStr);
+        if (cleanPhone.length === 10) {
+            phoneToJidMap.set('91' + cleanPhone, jidStr);
+        } else if (cleanPhone.length === 12 && cleanPhone.startsWith('91')) {
+            phoneToJidMap.set(cleanPhone.slice(2), jidStr);
+        }
+    }
+}
 
 // Determine Chromium path if available
 const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH ||
@@ -167,10 +182,15 @@ client.on('disconnected', async (reason) => {
  * Calling downloadMedia() immediately upon message arrival often returns undefined.
  * Retrying with backoff allows sufficient time for the media stream to resolve.
  */
-async function downloadMediaWithRetry(message, senderPhone, maxAttempts = 4, initialDelayMs = 800) {
+async function downloadMediaWithRetry(message, senderPhone, maxAttempts = 4, initialDelayMs = 1500) {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
             console.log(`[WhatsApp Bridge] Downloading media for message ${message.id && (message.id.id || message.id._serialized)} from ${senderPhone} (attempt ${attempt}/${maxAttempts})...`);
+
+            // Initial wait on attempt 1 to allow WhatsApp CDN decryption to begin
+            if (attempt === 1 && initialDelayMs > 0) {
+                await new Promise(r => setTimeout(r, initialDelayMs));
+            }
 
             // Warm up chat in memory before download (critical for @lid and background sessions)
             try {
@@ -182,11 +202,12 @@ async function downloadMediaWithRetry(message, senderPhone, maxAttempts = 4, ini
                 // Ignore warmup error and continue
             }
 
+            // 1. Primary: message.downloadMedia()
             let downloadedMedia = null;
             try {
                 const downloadPromise = message.downloadMedia();
                 const timeoutPromise = new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error('downloadMedia timed out after 15s')), 15000)
+                    setTimeout(() => reject(new Error('downloadMedia timed out after 12s')), 12000)
                 );
                 downloadedMedia = await Promise.race([downloadPromise, timeoutPromise]);
             } catch (err) {
@@ -194,8 +215,14 @@ async function downloadMediaWithRetry(message, senderPhone, maxAttempts = 4, ini
             }
 
             if (downloadedMedia && downloadedMedia.data && downloadedMedia.data.length > 0) {
-                console.log(`[WhatsApp Bridge] Media successfully downloaded on attempt ${attempt} for ${senderPhone} (mimetype: ${downloadedMedia.mimetype}, size: ${downloadedMedia.data.length} b64 chars)`);
-                return downloadedMedia;
+                const byteLength = Buffer.from(downloadedMedia.data, 'base64').length;
+                // Full-resolution photos are generally > 8KB. 1.4KB (1433 bytes) is a preview thumbnail.
+                if (byteLength > 8000 || attempt === maxAttempts) {
+                    console.log(`[WhatsApp Bridge] Media successfully downloaded on attempt ${attempt} for ${senderPhone} (mimetype: ${downloadedMedia.mimetype}, size: ${byteLength} bytes)`);
+                    return downloadedMedia;
+                } else {
+                    console.log(`[WhatsApp Bridge] Media on attempt ${attempt} is low-res preview (${byteLength} bytes). Waiting for full HD media...`);
+                }
             }
 
             // 2. Fallback: Fetch the message directly from the chat model
@@ -207,8 +234,11 @@ async function downloadMediaWithRetry(message, senderPhone, maxAttempts = 4, ini
                     if (match && match.hasMedia) {
                         const fallbackMedia = await match.downloadMedia();
                         if (fallbackMedia && fallbackMedia.data && fallbackMedia.data.length > 0) {
-                            console.log(`[WhatsApp Bridge] Media successfully downloaded via chat fetch fallback on attempt ${attempt}`);
-                            return fallbackMedia;
+                            const byteLength = Buffer.from(fallbackMedia.data, 'base64').length;
+                            if (byteLength > 8000 || attempt === maxAttempts) {
+                                console.log(`[WhatsApp Bridge] Media downloaded via chat fetch fallback on attempt ${attempt} (${byteLength} bytes)`);
+                                return fallbackMedia;
+                            }
                         }
                     }
                 }
@@ -221,7 +251,8 @@ async function downloadMediaWithRetry(message, senderPhone, maxAttempts = 4, ini
                 try {
                     const serializedId = message.id && (message.id._serialized || String(message.id));
                     const rawId = message.id && (message.id.id || message.id._serialized || String(message.id));
-                    const pupMedia = await client.pupPage.evaluate(async (sId, rId) => {
+                    const isFinalAttempt = (attempt === maxAttempts);
+                    const pupMedia = await client.pupPage.evaluate(async (sId, rId, finalAttempt) => {
                         try {
                             if (!window.Store || !window.Store.Msg) return null;
                             const m = window.Store.Msg.get(sId) ||
@@ -230,40 +261,43 @@ async function downloadMediaWithRetry(message, senderPhone, maxAttempts = 4, ini
                                 ));
                             if (!m) return null;
 
+                            // Force download on internal model if available
+                            if (m.downloadMedia && typeof m.downloadMedia === 'function') {
+                                try {
+                                    await m.downloadMedia({ downloadEvenIfDisabled: true, rmr: true });
+                                } catch (_) {}
+                            }
+
                             // Check if decrypted renderableUrl blob is available
                             if (m.mediaData && m.mediaData.renderableUrl && window.WWebJS && window.WWebJS.readBlob) {
                                 try {
                                     const b64 = await window.WWebJS.readBlob(m.mediaData.renderableUrl);
-                                    if (b64) return { data: b64, mimetype: m.mimetype || 'image/jpeg', filename: m.filename || 'id_card.jpg' };
+                                    if (b64 && (b64.length > 10000 || finalAttempt)) {
+                                        return { data: b64, mimetype: m.mimetype || 'image/jpeg', filename: m.filename || 'id_card.jpg' };
+                                    }
                                 } catch (_) {}
                             }
 
-                            // Check if preview data is available
-                            if (m.mediaData && m.mediaData.preview) {
+                            // Only on final attempt: allow low-res preview data if full download never resolved
+                            if (finalAttempt && m.mediaData && m.mediaData.preview) {
                                 const p = m.mediaData.preview;
                                 const b64 = typeof p === 'string' && p.startsWith('data:') ? p.split(',')[1] : (typeof p === 'string' ? p : null);
                                 if (b64 && b64.length > 50) {
                                     return { data: b64, mimetype: m.mimetype || 'image/jpeg', filename: 'id_card.jpg' };
                                 }
                             }
-
-                            // Check if rendered in DOM img tag
-                            const img = document.querySelector(`div[data-id*="${rId}"] img, div[data-id*="${sId}"] img`);
-                            if (img && img.src && window.WWebJS && window.WWebJS.readBlob) {
-                                try {
-                                    const b64 = await window.WWebJS.readBlob(img.src);
-                                    if (b64) return { data: b64, mimetype: 'image/jpeg', filename: 'id_card.jpg' };
-                                } catch (_) {}
-                            }
                         } catch (e) {
                             return null;
                         }
                         return null;
-                    }, serializedId, rawId);
+                    }, serializedId, rawId, isFinalAttempt);
 
                     if (pupMedia && pupMedia.data) {
-                        console.log(`[WhatsApp Bridge] Successfully recovered media via Puppeteer DOM/blob on attempt ${attempt}`);
-                        return pupMedia;
+                        const byteLength = Buffer.from(pupMedia.data, 'base64').length;
+                        if (byteLength > 8000 || attempt === maxAttempts) {
+                            console.log(`[WhatsApp Bridge] Successfully recovered full media via Puppeteer on attempt ${attempt} (${byteLength} bytes)`);
+                            return pupMedia;
+                        }
                     }
                 } catch (pupErr) {
                     console.warn(`[WhatsApp Bridge] Puppeteer media extraction error on attempt ${attempt}:`, pupErr.message);
@@ -290,7 +324,7 @@ async function downloadMediaWithRetry(message, senderPhone, maxAttempts = 4, ini
                                 }
 
                                 if (b64Data && b64Data.length > 50) {
-                                    console.log(`[WhatsApp Bridge] Recovered media from message._data (${b64Data.length} chars)`);
+                                    console.log(`[WhatsApp Bridge] Final fallback: recovered media from message._data (${b64Data.length} chars)`);
                                     return {
                                         mimetype: d.mimetype || message.mimetype || 'image/jpeg',
                                         data: b64Data,
@@ -305,13 +339,13 @@ async function downloadMediaWithRetry(message, senderPhone, maxAttempts = 4, ini
                 }
             }
 
-            console.warn(`[WhatsApp Bridge] downloadMedia returned null/empty data on attempt ${attempt} for ${senderPhone}`);
+            console.warn(`[WhatsApp Bridge] downloadMedia returned null or low-res data on attempt ${attempt} for ${senderPhone}`);
         } catch (err) {
             console.warn(`[WhatsApp Bridge] downloadMedia attempt ${attempt} general error for ${senderPhone}:`, err.message);
         }
 
         if (attempt < maxAttempts) {
-            const waitTime = initialDelayMs * attempt;
+            const waitTime = 1500 + attempt * 1000;
             console.log(`[WhatsApp Bridge] Waiting ${waitTime}ms before retry attempt ${attempt + 1}...`);
             await new Promise(r => setTimeout(r, waitTime));
         }
@@ -438,6 +472,7 @@ client.on('message', async (message) => {
 
         const senderJid = message.from; // raw JID — may be @c.us, @lid, or @g.us
         const senderPhone = await resolveSenderPhone(message, senderJid);
+        recordPhoneJid(senderPhone, senderJid);
         let mediaInfo = null;
 
         // Check if message has media either via hasMedia flag or media-related message types
@@ -447,6 +482,16 @@ client.on('message', async (message) => {
         );
 
         if (hasMediaFlag) {
+            // Immediate interim acknowledgement so the user knows their photo is being handled
+            try {
+                await client.sendMessage(
+                    senderJid,
+                    "⏳ *Photo received!* We are processing your ID card and forwarding it to our admin team. Please wait a few seconds..."
+                );
+            } catch (ackErr) {
+                console.warn('[WhatsApp Bridge] Failed to send interim photo ack:', ackErr.message);
+            }
+
             try {
                 const downloadedMedia = await downloadMediaWithRetry(message, senderPhone);
                 if (downloadedMedia) {
@@ -654,18 +699,76 @@ app.get('/qr-data', (req, res) => {
 // a resolution via getNumberId() makes the client look up the contact's
 // current WhatsApp id (whichever form it actually uses) before sending.
 async function resolveChatId(rawTo) {
-    const toStr = rawTo.toString();
+    const toStr = rawTo.toString().trim();
     if (toStr.includes('@')) {
-        return toStr; // already a full JID (e.g. stored @lid) — trust it
+        return toStr; // already a full JID (e.g. stored @lid or @c.us) — trust it
     }
-    const digits = toStr.replace(/[^0-9]/g, '');
+    let digits = toStr.replace(/[^0-9]/g, '');
+    if (digits.length === 10 && ['6', '7', '8', '9'].includes(digits[0])) {
+        digits = '91' + digits;
+    } else if (digits.length === 11 && digits.startsWith('0') && ['6', '7', '8', '9'].includes(digits[1])) {
+        digits = '91' + digits.slice(1);
+    }
+
+    // 1. Check local phoneToJidMap (e.g. 916371737949 or 6371737949 -> 162947334668337@lid)
+    if (phoneToJidMap.has(digits)) {
+        const cached = phoneToJidMap.get(digits);
+        console.log(`[WhatsApp Bridge] Resolved ${rawTo} -> ${cached} via phoneToJidMap`);
+        return cached;
+    }
+    if (digits.length === 12 && digits.startsWith('91') && phoneToJidMap.has(digits.slice(2))) {
+        const cached = phoneToJidMap.get(digits.slice(2));
+        console.log(`[WhatsApp Bridge] Resolved ${rawTo} -> ${cached} via phoneToJidMap (10-digit)`);
+        return cached;
+    }
+
+    // 2. Query Puppeteer Store for LidUtils / Contact LID
+    if (client.pupPage) {
+        try {
+            const storeJid = await client.pupPage.evaluate(async (pn) => {
+                try {
+                    if (!window.Store) return null;
+                    const cUsJid = pn + '@c.us';
+                    const wid = window.Store.WidFactory ? window.Store.WidFactory.createWid(cUsJid) : cUsJid;
+
+                    // Try LidUtils.getCurrentLid
+                    if (window.Store.LidUtils && typeof window.Store.LidUtils.getCurrentLid === 'function') {
+                        const lidWid = await window.Store.LidUtils.getCurrentLid(wid);
+                        if (lidWid) {
+                            const res = lidWid._serialized || (typeof lidWid === 'string' ? lidWid : null);
+                            if (res) return res;
+                        }
+                    }
+                    // Try Contact store
+                    if (window.Store.Contact) {
+                        const c = window.Store.Contact.get(cUsJid) || window.Store.Contact.get(pn);
+                        if (c && c.lid) {
+                            const res = c.lid._serialized || (typeof c.lid === 'string' ? c.lid : null);
+                            if (res) return res;
+                        }
+                    }
+                } catch (_) {}
+                return null;
+            }, digits);
+
+            if (storeJid) {
+                recordPhoneJid(digits, storeJid);
+                console.log(`[WhatsApp Bridge] Resolved ${rawTo} -> ${storeJid} via Puppeteer Store`);
+                return storeJid;
+            }
+        } catch (pupErr) {
+            console.warn(`[WhatsApp Bridge] Puppeteer Store LID resolution failed for ${digits}:`, pupErr.message);
+        }
+    }
+
+    // 3. Fallback to client.getNumberId
     try {
         const numberId = await client.getNumberId(digits);
         if (numberId && numberId._serialized) {
             return numberId._serialized;
         }
     } catch (err) {
-        console.warn(`[WhatsApp Bridge] getNumberId lookup failed for ${digits}, falling back to @c.us:`, err.message);
+        console.warn(`[WhatsApp Bridge] getNumberId lookup failed for ${digits}:`, err.message);
     }
     return `${digits}@c.us`;
 }
@@ -692,8 +795,15 @@ app.post('/send-message', async (req, res) => {
             result = await client.sendMessage(chatId, message);
         } catch (sendErr) {
             console.warn(`[WhatsApp Bridge] Primary sendMessage to ${chatId} failed (${sendErr.message}), trying fallback...`);
+            let fallbackChatId = null;
             if (chatId.includes('@lid')) {
-                const fallbackChatId = chatId.replace(/@lid$/, '@c.us');
+                fallbackChatId = chatId.replace(/@lid$/, '@c.us');
+            } else if (chatId.includes('@c.us')) {
+                const rawPn = chatId.replace(/@c\.us$/, '');
+                fallbackChatId = phoneToJidMap.get(rawPn) || (rawPn.length === 12 && rawPn.startsWith('91') ? phoneToJidMap.get(rawPn.slice(2)) : null);
+            }
+            if (fallbackChatId && fallbackChatId !== chatId) {
+                console.log(`[WhatsApp Bridge] Retrying sendMessage with fallback ID: ${fallbackChatId}`);
                 result = await client.sendMessage(fallbackChatId, message);
             } else {
                 throw sendErr;
@@ -752,8 +862,15 @@ app.post('/send-media', async (req, res) => {
             result = await client.sendMessage(chatId, media, { caption: caption || '' });
         } catch (sendErr) {
             console.warn(`[WhatsApp Bridge] Primary sendMedia to ${chatId} failed (${sendErr.message}), trying fallback...`);
+            let fallbackChatId = null;
             if (chatId.includes('@lid')) {
-                const fallbackChatId = chatId.replace(/@lid$/, '@c.us');
+                fallbackChatId = chatId.replace(/@lid$/, '@c.us');
+            } else if (chatId.includes('@c.us')) {
+                const rawPn = chatId.replace(/@c\.us$/, '');
+                fallbackChatId = phoneToJidMap.get(rawPn) || (rawPn.length === 12 && rawPn.startsWith('91') ? phoneToJidMap.get(rawPn.slice(2)) : null);
+            }
+            if (fallbackChatId && fallbackChatId !== chatId) {
+                console.log(`[WhatsApp Bridge] Retrying sendMedia with fallback ID: ${fallbackChatId}`);
                 result = await client.sendMessage(fallbackChatId, media, { caption: caption || '' });
             } else {
                 throw sendErr;
@@ -796,11 +913,52 @@ app.post('/forward-message', async (req, res) => {
             return res.status(404).json({ error: `Message ${message_id} not found in bridge cache.` });
         }
 
-        const result = await msg.forward(chatId);
-        const forwardedId = (result && result.id && (result.id.id || result.id._serialized || result.id))
-            || (result && (result._serialized || result.id))
-            || 'FWD_' + Date.now();
-        console.log(`[WhatsApp Bridge] Successfully forwarded original message ${message_id} to ${chatId}: forwardedId=${forwardedId}`);
+        let forwardedId = null;
+
+        // 1. Try native forward with chat warmup
+        try {
+            try {
+                const targetChat = await client.getChatById(chatId);
+                if (targetChat && targetChat.syncHistory) {
+                    await targetChat.syncHistory().catch(() => {});
+                }
+            } catch (_) {}
+
+            const result = await msg.forward(chatId);
+            forwardedId = (result && result.id && (result.id.id || result.id._serialized || result.id))
+                || (result && (result._serialized || result.id))
+                || 'FWD_' + Date.now();
+            console.log(`[WhatsApp Bridge] Successfully forwarded original message ${message_id} to ${chatId}: forwardedId=${forwardedId}`);
+        } catch (fwdErr) {
+            console.warn(`[WhatsApp Bridge] Native msg.forward failed for ${message_id} to ${chatId} (${fwdErr.message}), falling back to direct media send...`);
+
+            // 2. Safe Fallback: Send media directly via client.sendMessage
+            let mediaToSend = null;
+            if (msg.hasMedia) {
+                mediaToSend = await msg.downloadMedia().catch(() => null);
+            }
+            if (!mediaToSend) {
+                try {
+                    const files = fs.readdirSync(MEDIA_STORAGE_PATH).sort((a, b) => {
+                        return fs.statSync(path.join(MEDIA_STORAGE_PATH, b)).mtimeMs - fs.statSync(path.join(MEDIA_STORAGE_PATH, a)).mtimeMs;
+                    });
+                    if (files.length > 0) {
+                        const latestFile = path.join(MEDIA_STORAGE_PATH, files[0]);
+                        mediaToSend = MessageMedia.fromFilePath(latestFile);
+                    }
+                } catch (_) {}
+            }
+
+            if (mediaToSend) {
+                const sendResult = await client.sendMessage(chatId, mediaToSend, { caption: msg.body || '🆔 Forwarded Student ID Card' });
+                forwardedId = (sendResult && sendResult.id && (sendResult.id.id || sendResult.id._serialized || sendResult.id))
+                    || 'FWD_FALLBACK_' + Date.now();
+                console.log(`[WhatsApp Bridge] Forward fallback sent media successfully to ${chatId}: ${forwardedId}`);
+            } else {
+                throw fwdErr;
+            }
+        }
+
         res.json({ success: true, messageId: forwardedId });
     } catch (err) {
         console.error(`[WhatsApp Bridge] Failed to forward message ${message_id} to ${to}:`, err);

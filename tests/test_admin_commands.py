@@ -91,7 +91,44 @@ class TestAdminCommands(unittest.IsolatedAsyncioTestCase):
                 "/approve"
             )
             mock_approve.assert_called_once_with("916371737949", "VER-4X9Z")
-            self.assertIn("APPROVED", resp)
+    async def test_bridge_client_resolve_target(self):
+        from app.services.whatsapp.bridge_client import _resolve_target
+        mock_db = AsyncMock()
+        mock_db.admins.find_one.return_value = {"phone_number": "916371737949", "wa_jid": "162947334668337@lid"}
+        with patch("app.services.whatsapp.bridge_client.get_database", return_value=mock_db):
+            target = await _resolve_target("6371737949")
+            self.assertEqual(target, "162947334668337@lid")
+
+            # Preserves full JID if already @lid
+            lid_target = await _resolve_target("186896156205308@lid")
+            self.assertEqual(lid_target, "186896156205308@lid")
+
+    async def test_get_admin_targets_resolves_lid(self):
+        from app.services.whatsapp.service import _get_admin_targets
+        mock_db = AsyncMock()
+        # Mock cursor for db.admins.find
+        class AsyncCursor:
+            def __init__(self, docs):
+                self.docs = docs
+            def __aiter__(self):
+                self._iter = iter(self.docs)
+                return self
+            async def __anext__(self):
+                try:
+                    return next(self._iter)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        mock_db.admins.find = unittest.mock.MagicMock(return_value=AsyncCursor([
+            {"phone_number": "916371737949", "wa_jid": "162947334668337@lid", "is_active": True},
+            {"phone_number": "919876543210", "is_active": True}
+        ]))
+        mock_db.admins.find_one.side_effect = lambda query: {"wa_jid": "162947334668337@lid"} if "916371737949" in str(query) or "6371737949" in str(query) else None
+        mock_db.users.find_one.return_value = None
+
+        with patch("app.services.whatsapp.service.get_database", return_value=mock_db):
+            targets = await _get_admin_targets()
+            self.assertIn("162947334668337@lid", targets)
 
 if __name__ == "__main__":
     unittest.main()

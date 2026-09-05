@@ -1,6 +1,24 @@
 import os
 from typing import List
 
+def normalize_phone(phone: str) -> str:
+    """
+    Normalizes phone numbers to standard format (e.g. 91XXXXXXXXXX for India).
+    Preserves JIDs with '@' (e.g. @lid or @c.us).
+    """
+    if not phone:
+        return ""
+    phone_str = str(phone).strip()
+    if "@" in phone_str:
+        return phone_str
+    clean = phone_str.replace("+", "").replace(" ", "").replace("-", "")
+    digits = "".join(filter(str.isdigit, clean))
+    if len(digits) == 10 and digits[0] in "6789":
+        return f"91{digits}"
+    if len(digits) == 11 and digits.startswith("0") and digits[1] in "6789":
+        return f"91{digits[1:]}"
+    return digits or clean
+
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
     class Settings(BaseSettings):
@@ -33,7 +51,7 @@ try:
         @property
         def admin_phone_list(self) -> List[str]:
             return [
-                phone.strip().replace("+", "").replace(" ", "").replace("-", "")
+                normalize_phone(phone)
                 for phone in self.ADMIN_PHONE_NUMBERS.split(",")
                 if phone.strip()
             ]
@@ -64,7 +82,7 @@ except ImportError:
         @property
         def admin_phone_list(self) -> List[str]:
             return [
-                phone.strip().replace("+", "").replace(" ", "").replace("-", "")
+                normalize_phone(phone)
                 for phone in self.ADMIN_PHONE_NUMBERS.split(",")
                 if phone.strip()
             ]
