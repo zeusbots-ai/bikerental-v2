@@ -194,18 +194,69 @@ client.on('disconnected', async (reason) => {
 });
 
 /**
+ * Safely extracts both raw message id and serialized message id.
+ * Handles recent WhatsApp Web update where _serialized was renamed to $1.
+ * Ensures message.id._serialized is always populated so whatsapp-web.js methods do not crash with 'r'.
+ */
+function resolveMessageIds(message) {
+    if (!message) return { rawId: '', serializedId: '' };
+
+    let rawId = '';
+    let serializedId = '';
+
+    if (typeof message.id === 'string') {
+        serializedId = message.id;
+        rawId = message.id.split('_').pop();
+    } else if (message.id && typeof message.id === 'object') {
+        const idObj = message.id;
+        rawId = idObj.id || (idObj._serialized && typeof idObj._serialized === 'string' && idObj._serialized.split('_').pop()) ||
+                (idObj.$1 && typeof idObj.$1 === 'string' && idObj.$1.split('_').pop()) || '';
+        serializedId = (typeof idObj._serialized === 'string' ? idObj._serialized : null) ||
+                       (typeof idObj.$1 === 'string' ? idObj.$1 : null);
+
+        if (!serializedId && idObj.remote && idObj.id) {
+            const fromMe = idObj.fromMe ? 'true' : 'false';
+            serializedId = `${fromMe}_${idObj.remote}_${idObj.id}`;
+        }
+    }
+
+    if (!rawId && message._data && message._data.id) {
+        rawId = typeof message._data.id === 'string' ? message._data.id : (message._data.id.id || '');
+    }
+
+    if (!serializedId && rawId) {
+        const fromMe = message.fromMe ? 'true' : 'false';
+        const remote = message.from || (message.id && message.id.remote) || '';
+        serializedId = remote ? `${fromMe}_${remote}_${rawId}` : rawId;
+    }
+
+    // Guarantee message.id._serialized and message.id.id are strings on the message instance
+    if (message.id && typeof message.id === 'object') {
+        if (!message.id._serialized && serializedId) {
+            message.id._serialized = serializedId;
+        }
+        if (!message.id.id && rawId) {
+            message.id.id = rawId;
+        }
+    }
+
+    return { rawId, serializedId };
+}
+
+/**
  * Asynchronously downloads media from a WhatsApp message with retry and timeout.
  * WhatsApp Web may take a few moments to decrypt and load media attachments from the CDN.
  * Retrying with backoff allows sufficient time for the media stream to resolve.
  * Rejects low-resolution thumbnails (<= 8000 bytes) so only clear, legible HD photos are accepted.
  */
 async function downloadMediaWithRetry(message, senderPhone, maxAttempts = 5, initialDelayMs = 2000) {
-    const serializedId = message.id && (message.id._serialized || String(message.id));
-    const rawId = message.id && (message.id.id || message.id._serialized || String(message.id));
+    const { rawId, serializedId } = resolveMessageIds(message);
+    const targetLabel = rawId || serializedId || 'unknown';
+    const chatFrom = message.from || (message.id && message.id.remote);
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-            console.log(`[WhatsApp Bridge] Downloading HD media for message ${serializedId || rawId} from ${senderPhone} (attempt ${attempt}/${maxAttempts})...`);
+            console.log(`[WhatsApp Bridge] Downloading HD media for message ${targetLabel} from ${senderPhone} (attempt ${attempt}/${maxAttempts})...`);
 
             // Initial wait on attempt 1 to allow WhatsApp CDN decryption to begin
             if (attempt === 1 && initialDelayMs > 0) {
@@ -214,89 +265,150 @@ async function downloadMediaWithRetry(message, senderPhone, maxAttempts = 5, ini
 
             // CRITICAL STEP 1: Actively open the chat in Puppeteer viewport
             // In headless Chromium, WhatsApp Web lazy-loads media. Opening the chat triggers full CDN decryption!
-            if (client.pupPage) {
+            if (client.pupPage && chatFrom) {
                 try {
                     await client.pupPage.evaluate(async (chatId) => {
                         try {
                             if (window.Store && window.Store.Cmd && window.Store.Cmd.openChatAt) {
                                 const chat = window.Store.Chat.get(chatId) ||
-                                    (window.Store.Chat.models && window.Store.Chat.models.find(c => c.id && c.id._serialized === chatId));
+                                    (window.Store.Chat.models && window.Store.Chat.models.find(c =>
+                                        c.id && (c.id._serialized === chatId || c.id.$1 === chatId || c.id.user === chatId)
+                                    ));
                                 if (chat) {
                                     await window.Store.Cmd.openChatAt(chat);
                                 }
                             }
                         } catch (_) {}
-                    }, message.from);
+                    }, chatFrom);
                 } catch (_) {}
             }
 
-            // CRITICAL STEP 2: Trigger downloadMedia on the internal message model in Puppeteer
+            // CRITICAL STEP 2: In Puppeteer, locate model, trigger download, and extract decrypted blob directly
             if (client.pupPage) {
                 try {
-                    await client.pupPage.evaluate(async (sId, rId) => {
+                    const pupMedia = await client.pupPage.evaluate(async (sId, rId, cFrom) => {
                         try {
-                            if (!window.Store || !window.Store.Msg) return;
-                            const m = window.Store.Msg.get(sId) ||
-                                (window.Store.Msg.models && window.Store.Msg.models.find(item =>
-                                    item.id && (item.id._serialized === sId || item.id.id === rId)
-                                ));
-                            if (m) {
-                                if (m.downloadMedia && typeof m.downloadMedia === 'function') {
-                                    await m.downloadMedia({ downloadEvenIfDisabled: true, rmr: true }).catch(() => {});
+                            if (!window.Store) return null;
+
+                            // 1. Locate message model safely without throwing
+                            let m = null;
+                            if (window.Store.Msg) {
+                                if (sId && typeof window.Store.Msg.get === 'function') {
+                                    try { m = window.Store.Msg.get(sId); } catch (_) {}
                                 }
-                                if (m.mediaData && m.mediaData.downloadMedia) {
-                                    await m.mediaData.downloadMedia({ downloadEvenIfDisabled: true, rmr: true }).catch(() => {});
+                                if (!m && window.Store.Msg.models && Array.isArray(window.Store.Msg.models)) {
+                                    m = window.Store.Msg.models.find(item => {
+                                        if (!item) return false;
+                                        const id = item.id;
+                                        if (!id) return false;
+                                        if (id === sId || id === rId) return true;
+                                        if (typeof id === 'object') {
+                                            if (id._serialized === sId || id.$1 === sId) return true;
+                                            if (id.id === rId || id.id === sId) return true;
+                                        }
+                                        return false;
+                                    });
                                 }
                             }
-                        } catch (_) {}
-                    }, serializedId, rawId);
-                } catch (_) {}
-            }
 
-            // CRITICAL STEP 3: Check renderableUrl blob or DOM img[src^="blob:"] directly in Puppeteer
-            if (client.pupPage) {
-                try {
-                    const pupMedia = await client.pupPage.evaluate(async (sId, rId) => {
-                        try {
-                            if (!window.Store || !window.Store.Msg) return null;
-                            const m = window.Store.Msg.get(sId) ||
-                                (window.Store.Msg.models && window.Store.Msg.models.find(item =>
-                                    item.id && (item.id._serialized === sId || item.id.id === rId)
-                                ));
+                            if (!m && window.Store.Chat && cFrom) {
+                                try {
+                                    const chat = window.Store.Chat.get(cFrom) ||
+                                        (window.Store.Chat.models && window.Store.Chat.models.find(c =>
+                                            c.id && (c.id._serialized === cFrom || c.id.$1 === cFrom)
+                                        ));
+                                    if (chat && chat.msgs && chat.msgs.models) {
+                                        m = chat.msgs.models.find(item => {
+                                            if (!item) return false;
+                                            const id = item.id;
+                                            if (!id) return false;
+                                            if (typeof id === 'object') {
+                                                return id.id === rId || id._serialized === sId || id.$1 === sId;
+                                            }
+                                            return id === rId || id === sId;
+                                        });
+                                    }
+                                } catch (_) {}
+                            }
+
                             if (!m) return null;
 
-                            let blobUrl = m.mediaData && m.mediaData.renderableUrl;
+                            // 2. Trigger download on message model
+                            try {
+                                if (m.downloadMedia && typeof m.downloadMedia === 'function') {
+                                    await m.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 });
+                                }
+                            } catch (_) {}
+
+                            if (m.mediaData) {
+                                try {
+                                    if (m.mediaData.downloadMedia && typeof m.mediaData.downloadMedia === 'function') {
+                                        await m.mediaData.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 });
+                                    }
+                                } catch (_) {}
+                            }
+
+                            // 3. Extract decrypted blob from renderableUrl, mediaBlob, or DOM
+                            let blobUrl = m.mediaData && (m.mediaData.renderableUrl || m.mediaData.mediaBlob);
                             if (!blobUrl) {
-                                const img = document.querySelector(`div[data-id="${sId}"] img[src^="blob:"]`) ||
-                                            document.querySelector(`div[data-id="${rId}"] img[src^="blob:"]`);
-                                if (img && img.src) blobUrl = img.src;
+                                const selectors = [
+                                    rId ? `div[data-id*="${rId}"] img[src^="blob:"]` : null,
+                                    sId ? `div[data-id*="${sId}"] img[src^="blob:"]` : null,
+                                    'div.message-in img[src^="blob:"]',
+                                    'img[src^="blob:"]'
+                                ].filter(Boolean);
+
+                                for (const sel of selectors) {
+                                    const img = document.querySelector(sel);
+                                    if (img && img.src && img.src.startsWith('blob:')) {
+                                        blobUrl = img.src;
+                                        break;
+                                    }
+                                }
                             }
 
                             if (blobUrl) {
-                                const resp = await fetch(blobUrl);
-                                const blob = await resp.blob();
-                                if (blob && blob.size > 8000) {
-                                    return new Promise((resolve) => {
-                                        const reader = new FileReader();
-                                        reader.onloadend = () => {
-                                            const dataUrl = reader.result;
-                                            const b64 = typeof dataUrl === 'string' && dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
-                                            resolve({
-                                                data: b64,
-                                                mimetype: blob.type || m.mimetype || 'image/jpeg',
-                                                filename: m.filename || 'id_card.jpg',
-                                                size: blob.size
-                                            });
+                                try {
+                                    const resp = await fetch(blobUrl);
+                                    const blob = await resp.blob();
+                                    if (blob && blob.size > 8000) {
+                                        return new Promise((resolve) => {
+                                            const reader = new FileReader();
+                                            reader.onloadend = () => {
+                                                const dataUrl = reader.result;
+                                                const b64 = typeof dataUrl === 'string' && dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+                                                resolve({
+                                                    data: b64,
+                                                    mimetype: blob.type || m.mimetype || 'image/jpeg',
+                                                    filename: m.filename || 'id_card.jpg',
+                                                    size: blob.size
+                                                });
+                                            };
+                                            reader.readAsDataURL(blob);
+                                        });
+                                    }
+                                } catch (_) {}
+                            }
+
+                            // 4. Try WWebJS readBlob if available
+                            if (m.mediaData && m.mediaData.renderableUrl && window.WWebJS && typeof window.WWebJS.readBlob === 'function') {
+                                try {
+                                    const b64 = await window.WWebJS.readBlob(m.mediaData.renderableUrl);
+                                    if (b64 && b64.length > 10000) {
+                                        return {
+                                            data: b64,
+                                            mimetype: m.mimetype || 'image/jpeg',
+                                            filename: m.filename || 'id_card.jpg',
+                                            size: Buffer.from(b64, 'base64').length
                                         };
-                                        reader.readAsDataURL(blob);
-                                    });
-                                }
+                                    }
+                                } catch (_) {}
                             }
                         } catch (e) {
                             return null;
                         }
                         return null;
-                    }, serializedId, rawId);
+                    }, serializedId, rawId, chatFrom);
 
                     if (pupMedia && pupMedia.data) {
                         const byteLength = Buffer.from(pupMedia.data, 'base64').length;
@@ -310,11 +422,11 @@ async function downloadMediaWithRetry(message, senderPhone, maxAttempts = 5, ini
                 }
             }
 
-            // CRITICAL STEP 4: Try standard message.downloadMedia()
+            // CRITICAL STEP 3: Try standard message.downloadMedia() now that message.id._serialized is guaranteed
             try {
                 const downloadPromise = message.downloadMedia();
                 const timeoutPromise = new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error('downloadMedia timed out after 10s')), 10000)
+                    setTimeout(() => reject(new Error('downloadMedia timed out after 8s')), 8000)
                 );
                 const downloadedMedia = await Promise.race([downloadPromise, timeoutPromise]);
                 if (downloadedMedia && downloadedMedia.data && downloadedMedia.data.length > 0) {
@@ -329,30 +441,6 @@ async function downloadMediaWithRetry(message, senderPhone, maxAttempts = 5, ini
             } catch (err) {
                 console.warn(`[WhatsApp Bridge] downloadMedia attempt ${attempt} error for ${senderPhone}:`, err.message);
             }
-
-            // CRITICAL STEP 5: Try chat.fetchMessages fallback
-            try {
-                const chat = await message.getChat();
-                if (chat) {
-                    const recentMsgs = await chat.fetchMessages({ limit: 5 });
-                    const match = recentMsgs.find(m => m.id && (m.id._serialized === serializedId || m.id.id === rawId));
-                    if (match && match.hasMedia) {
-                        const fallbackMedia = await match.downloadMedia();
-                        if (fallbackMedia && fallbackMedia.data && fallbackMedia.data.length > 0) {
-                            const byteLength = Buffer.from(fallbackMedia.data, 'base64').length;
-                            if (byteLength > 8000) {
-                                console.log(`[WhatsApp Bridge] Media downloaded via chat fetch fallback on attempt ${attempt} (${byteLength} bytes)`);
-                                return fallbackMedia;
-                            }
-                        }
-                    }
-                }
-            } catch (fallbackErr) {
-                console.warn(`[WhatsApp Bridge] Chat fetch fallback attempt ${attempt} error:`, fallbackErr.message);
-            }
-
-            // NOTE: We deliberately DO NOT return low-res thumbnails (<= 8000 bytes)!
-            // Returning a 1433-byte thumbnail causes the bot to forward an illegible image.
         } catch (err) {
             console.warn(`[WhatsApp Bridge] downloadMedia attempt ${attempt} general error for ${senderPhone}:`, err.message);
         }
@@ -484,7 +572,8 @@ client.on('message', async (message) => {
             return;
         }
 
-        const msgRawId = message.id && (message.id.id || message.id._serialized || String(message.id));
+        const { rawId, serializedId } = resolveMessageIds(message);
+        const msgRawId = rawId || serializedId;
         if (msgRawId && isDuplicateMessage(msgRawId)) {
             console.log(`[WhatsApp Bridge] Dropping duplicate incoming message event: ${msgRawId}`);
             return;
@@ -559,11 +648,11 @@ client.on('message', async (message) => {
             }
         }
 
-        if (msgRawId) {
-            recentMessages.set(msgRawId, message);
+        if (rawId) {
+            recentMessages.set(rawId, message);
         }
-        if (message.id && message.id._serialized) {
-            recentMessages.set(message.id._serialized, message);
+        if (serializedId) {
+            recentMessages.set(serializedId, message);
         }
         if (recentMessages.size > 500) {
             const oldestKey = recentMessages.keys().next().value;
